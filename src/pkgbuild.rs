@@ -15,9 +15,11 @@ pub struct PkgBuild {
     pub url: String,
     pub license: Vec<String>,
     pub source: Vec<String>,
+    pub makedepends: Vec<String>,
 
     pub package: Script,
     pub build: Script,
+    pub prepare: Script,
 }
 
 #[derive(Debug)]
@@ -26,6 +28,7 @@ pub enum Error {
     UnexpectedByte(u8),
     ExpectedUtf8(std::str::Utf8Error),
     MissingField(&'static str),
+    UnknownField(String),
 }
 
 struct Reader<R> {
@@ -48,10 +51,7 @@ macro_rules! replace_members {
 
 macro_rules! replace {
     (String: $self:expr, $ac:expr, [$($field:ident),*]) => {
-        $($self.$field = $ac.replace_all(
-            &$self.$field,
-            replace_members!($self),
-        ));*
+        $($self.$field = $ac.replace_all(&$self.$field, replace_members!($self)));*
     };
     (Option<String>: $self:expr, $ac:expr, [$($field:ident),*]) => {
         $(if let Some(f) = $self.$field.as_deref() {
@@ -63,12 +63,12 @@ macro_rules! replace {
     };
     (Vec<String>: $self:expr, $ac:expr, [$($field:ident),*]) => {
         $(for f in $self.$field.iter_mut() {
-            *f = $ac.replace_all(
-                f,
-                replace_members!($self),
-            )
+            *f = $ac.replace_all(f, replace_members!($self))
         });*
     };
+    (Script: $self:expr, $ac:expr, [$($field:ident),*]) => {
+        $($self.$field.0 = $ac.replace_all(&$self.$field.0, replace_members!($self) ));*
+    }
 }
 
 impl PkgBuild {
@@ -83,9 +83,11 @@ impl PkgBuild {
         let mut url = None;
         let mut license = Vec::new();
         let mut source = Vec::new();
+        let mut makedepends = Vec::new();
 
         let mut package = None;
         let mut build = None;
+        let mut prepare = None;
 
         loop {
             let mut buf = Vec::new();
@@ -114,7 +116,10 @@ impl PkgBuild {
                         "url" => Self::parse_str_field(&mut reader, &mut url)?,
                         "license" => Self::parse_list_field(&mut reader, &mut license)?,
                         "source" => Self::parse_list_field(&mut reader, &mut source)?,
-                        _ => {}
+                        "makedepends" => Self::parse_list_field(&mut reader, &mut makedepends)?,
+                        _ => {
+                            return Err(Error::UnknownField(key));
+                        }
                     };
                 }
                 Some(b'(') => {
@@ -146,7 +151,10 @@ impl PkgBuild {
                     match key.as_str() {
                         "package" => package.replace(Script(value)).dummy(),
                         "build" => build.replace(Script(value)).dummy(),
-                        _ => {}
+                        "prepare" => prepare.replace(Script(value)).dummy(),
+                        _ => {
+                            return Err(Error::UnknownField(key));
+                        }
                     };
                 }
                 Some(b) => {
@@ -169,8 +177,10 @@ impl PkgBuild {
             url: url.ok_or(Error::MissingField("url"))?,
             license,
             source,
+            makedepends,
             package: package.ok_or(Error::MissingField("package"))?,
             build: build.ok_or(Error::MissingField("build"))?,
+            prepare: prepare.ok_or(Error::MissingField("prepare"))?,
         };
         this.fixup();
         Ok(this)
@@ -234,7 +244,7 @@ impl PkgBuild {
                     let _ = reader.read_byte();
                 }
                 _ => {
-                    reader.read_while(&mut buf, |b| b != b')')?;
+                    reader.read_while(&mut buf, |b| !b.is_ascii_whitespace() && b != b')')?;
                 }
             }
             buf.pop_if(|b| *b == b'\r');
@@ -254,7 +264,8 @@ impl PkgBuild {
             .unwrap();
         replace!(String: self, ac, [pkgname, pkgver, pkgrel, url]);
         replace!(Option<String>: self, ac, [epoch, pkgdesc]);
-        replace!(Vec<String>: self, ac, [license, source]);
+        replace!(Vec<String>: self, ac, [license, source, makedepends]);
+        replace!(Script: self, ac, [package, build, prepare]);
         self.pkgname = self.pkgname.replace("pkgver", "");
     }
 }
