@@ -1,27 +1,5 @@
 use std::io::Read;
 
-use aho_corasick::AhoCorasick;
-
-#[derive(Debug)]
-pub struct Script(String);
-
-#[derive(Debug)]
-pub struct PkgBuild {
-    pub pkgname: String,
-    pub pkgver: String,
-    pub pkgrel: String,
-    pub epoch: Option<String>,
-    pub pkgdesc: Option<String>,
-    pub url: String,
-    pub license: Vec<String>,
-    pub source: Vec<String>,
-    pub makedepends: Vec<String>,
-
-    pub package: Script,
-    pub build: Script,
-    pub prepare: Script,
-}
-
 #[derive(Debug)]
 pub enum Error {
     IO(std::io::Error),
@@ -31,161 +9,130 @@ pub enum Error {
     UnknownField(String),
 }
 
+macros::make_pkgbuild_struct! {
+    #[derive(Debug)]
+    pub struct PkgBuild {
+        required: [pkgname, pkgver, pkgrel, url],
+        optional: [epoch, pkgdesc],
+        multi: [license, source, makedepends],
+        script: [package, build, prepare],
+    }
+}
+
+#[derive(Debug)]
+pub struct Script(String);
+
+mod macros {
+    macro_rules! make_pkgbuild_struct {
+        ($(#[$attr:meta])* $vis:vis struct $name:ident {
+            required: [$($req:ident),*],
+            optional: [$($opt:ident),*],
+            multi:    [$($mul:ident),*],
+            script:   [$($scr:ident),*],
+        }) => {
+            $(#[$attr])*
+            $vis struct $name {
+                $($req: String,)*
+                $($opt: Option<String>,)*
+                $($mul: Vec<String>,)*
+                $($scr: Script,)*
+            }
+
+            impl $name {
+                $vis fn parse(r: impl Read) -> Result<Self, Error> {
+                    let mut reader = Reader::new(r);
+                    $(let mut $req = None;)*
+                    $(let mut $opt = None;)*
+                    $(let mut $mul = Vec::new();)*
+                    $(let mut $scr = None;)*
+                    loop {
+                        let mut buf = Vec::new();
+                        reader.skip_while(|b| b.is_ascii_whitespace())?;
+                        reader.read_while(&mut buf, |b| b.is_ascii_alphabetic())?;
+                        if buf.is_empty() {
+                            if reader.peek_byte()?.is_some_and(|b| b == b'#') {
+                                reader.skip_while(|b| b != b'\n')?;
+                                let _ = reader.read_byte();
+                                continue;
+                            }
+                            break;
+                        }
+                        let key = unsafe { String::from_utf8_unchecked(buf) };
+
+                        reader.skip_while(|b| b.is_ascii_whitespace())?;
+                        let symbol = reader.read_byte()?;
+                        match symbol {
+                            Some(b'=') => {
+                                match key.as_str() {
+                                    $(stringify!($req) => Self::parse_str_field(&mut reader, &mut $req)?,)*
+                                    $(stringify!($opt) => Self::parse_str_field(&mut reader, &mut $opt)?,)*
+                                    $(stringify!($mul) => Self::parse_list_field(&mut reader, &mut $mul)?,)*
+                                    _ => {
+                                        return Err(Error::UnknownField(key));
+                                    }
+                                }
+                            }
+                            Some(b'(') => {
+                                reader.expect_byte(b')')?;
+                                reader.skip_while(|b| b.is_ascii_whitespace())?;
+                                reader.expect_byte(b'{')?;
+                                reader.skip_while(|b| b.is_ascii_whitespace())?;
+                                let mut count = 0;
+                                let mut buf = Vec::new();
+                                while let Some(b) = reader.read_byte()? {
+                                    match b {
+                                        b'}' if count == 0 => { break; }
+                                        b'{' => { buf.push(b); count += 1; }
+                                        b'}' => { buf.push(b); count -= 1; }
+                                        b => { buf.push(b); }
+                                    }
+                                }
+                                let value = String::from_utf8(buf)?;
+                                match key.as_str() {
+                                    $(stringify!($scr) => $scr.replace(Script(value)).dummy(),)*
+                                    _ => {
+                                        return Err(Error::UnknownField(key));
+                                    }
+                                }
+                            }
+                            Some(b) => { return Err(Error::UnexpectedByte(b)); }
+                            None => { return Err(Error::IO(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))); }
+                        }
+                    }
+                    let mut this = Self {
+                        $($req: $req.ok_or(Error::MissingField(stringify!($req)))?,)*
+                        $($opt,)*
+                        $($mul,)*
+                        $($scr: $scr.ok_or(Error::MissingField(stringify!($scr)))?,)*
+                    };
+                    this.fixup();
+                    Ok(this)
+                }
+                fn fixup(&mut self) {
+                    let ac = aho_corasick::AhoCorasick::builder().build([
+                        $(concat!("$", stringify!($req)),)*
+                        $(concat!("$", stringify!($opt)),)*
+                    ]).unwrap();
+                    let members = [$(&self.$req,)* $(self.$opt.as_deref().unwrap_or_default(),)*];
+                    $(let $req = ac.replace_all(&self.$req, &members);)*
+                    $(let $opt = self.$opt.as_deref().map(|o| ac.replace_all(o, &members));)*
+                    $(for f in self.$mul.iter_mut() { *f = ac.replace_all(f, &members); })*
+                    $(self.$scr.0 = ac.replace_all(&self.$scr.0, &members);)*
+                    $(self.$req = $req;)*
+                    $(self.$opt = $opt;)*
+                }
+            }
+        };
+    }
+    pub(crate) use make_pkgbuild_struct;
+}
+
 struct Reader<R> {
     inner: R,
     peeked: Option<u8>,
 }
 
-macro_rules! replace_members {
-    ($self:expr) => {
-        &[
-            &$self.pkgname,
-            &$self.pkgver,
-            &$self.pkgrel,
-            $self.epoch.as_deref().unwrap_or_default(),
-            $self.pkgdesc.as_deref().unwrap_or_default(),
-            &$self.url,
-        ]
-    };
-}
-
-macro_rules! replace {
-    (String: $self:expr, $ac:expr, [$($field:ident),*]) => {
-        $($self.$field = $ac.replace_all(&$self.$field, replace_members!($self)));*
-    };
-    (Option<String>: $self:expr, $ac:expr, [$($field:ident),*]) => {
-        $(if let Some(f) = $self.$field.as_deref() {
-            $self.$field = Some($ac.replace_all(
-                f,
-                replace_members!($self),
-            ))
-        });*
-    };
-    (Vec<String>: $self:expr, $ac:expr, [$($field:ident),*]) => {
-        $(for f in $self.$field.iter_mut() {
-            *f = $ac.replace_all(f, replace_members!($self))
-        });*
-    };
-    (Script: $self:expr, $ac:expr, [$($field:ident),*]) => {
-        $($self.$field.0 = $ac.replace_all(&$self.$field.0, replace_members!($self) ));*
-    }
-}
-
 impl PkgBuild {
-    pub fn parse(r: impl Read) -> Result<Self, Error> {
-        let mut reader = Reader::new(r);
-
-        let mut pkgname = None;
-        let mut pkgver = None;
-        let mut pkgrel = None;
-        let mut epoch = None;
-        let mut pkgdesc = None;
-        let mut url = None;
-        let mut license = Vec::new();
-        let mut source = Vec::new();
-        let mut makedepends = Vec::new();
-
-        let mut package = None;
-        let mut build = None;
-        let mut prepare = None;
-
-        loop {
-            let mut buf = Vec::new();
-            reader.skip_while(|b| b.is_ascii_whitespace())?;
-            reader.read_while(&mut buf, |b| b.is_ascii_alphabetic())?;
-            if buf.is_empty() {
-                if reader.peek_byte()?.is_some_and(|b| b == b'#') {
-                    reader.skip_while(|b| b != b'\n')?;
-                    let _ = reader.read_byte();
-                    continue;
-                }
-                break;
-            }
-            let key = unsafe { String::from_utf8_unchecked(buf) };
-
-            reader.skip_while(|b| b.is_ascii_whitespace())?;
-            let symbol = reader.read_byte()?;
-            match symbol {
-                Some(b'=') => {
-                    match key.as_str() {
-                        "pkgname" => Self::parse_str_field(&mut reader, &mut pkgname)?,
-                        "pkgver" => Self::parse_str_field(&mut reader, &mut pkgver)?,
-                        "pkgrel" => Self::parse_str_field(&mut reader, &mut pkgrel)?,
-                        "epoch" => Self::parse_str_field(&mut reader, &mut epoch)?,
-                        "pkgdesc" => Self::parse_str_field(&mut reader, &mut pkgdesc)?,
-                        "url" => Self::parse_str_field(&mut reader, &mut url)?,
-                        "license" => Self::parse_list_field(&mut reader, &mut license)?,
-                        "source" => Self::parse_list_field(&mut reader, &mut source)?,
-                        "makedepends" => Self::parse_list_field(&mut reader, &mut makedepends)?,
-                        _ => {
-                            return Err(Error::UnknownField(key));
-                        }
-                    };
-                }
-                Some(b'(') => {
-                    reader.expect_byte(b')')?;
-                    reader.skip_while(|b| b.is_ascii_whitespace())?;
-                    reader.expect_byte(b'{')?;
-                    reader.skip_while(|b| b.is_ascii_whitespace())?;
-                    let mut count = 0;
-                    let mut buf = Vec::new();
-                    while let Some(b) = reader.read_byte()? {
-                        match b {
-                            b'}' if count == 0 => {
-                                break;
-                            }
-                            b'{' => {
-                                buf.push(b);
-                                count += 1;
-                            }
-                            b'}' => {
-                                buf.push(b);
-                                count -= 1;
-                            }
-                            b => {
-                                buf.push(b);
-                            }
-                        }
-                    }
-                    let value = String::from_utf8(buf)?;
-                    match key.as_str() {
-                        "package" => package.replace(Script(value)).dummy(),
-                        "build" => build.replace(Script(value)).dummy(),
-                        "prepare" => prepare.replace(Script(value)).dummy(),
-                        _ => {
-                            return Err(Error::UnknownField(key));
-                        }
-                    };
-                }
-                Some(b) => {
-                    return Err(Error::UnexpectedByte(b));
-                }
-                None => {
-                    return Err(Error::IO(std::io::Error::from(
-                        std::io::ErrorKind::UnexpectedEof,
-                    )));
-                }
-            }
-        }
-
-        let mut this = Self {
-            pkgname: pkgname.ok_or(Error::MissingField("pkgname"))?,
-            pkgver: pkgver.ok_or(Error::MissingField("pkgver"))?,
-            pkgrel: pkgrel.ok_or(Error::MissingField("pkgrel"))?,
-            epoch,
-            pkgdesc,
-            url: url.ok_or(Error::MissingField("url"))?,
-            license,
-            source,
-            makedepends,
-            package: package.ok_or(Error::MissingField("package"))?,
-            build: build.ok_or(Error::MissingField("build"))?,
-            prepare: prepare.ok_or(Error::MissingField("prepare"))?,
-        };
-        this.fixup();
-        Ok(this)
-    }
-
     fn parse_str_field<R: Read>(
         reader: &mut Reader<R>,
         value: &mut Option<String>,
@@ -254,19 +201,6 @@ impl PkgBuild {
             reader.skip_while(|b| b.is_ascii_whitespace())?;
         }
         Ok(())
-    }
-
-    fn fixup(&mut self) {
-        let ac = AhoCorasick::builder()
-            .build([
-                "$pkgname", "$pkgver", "$pkgrel", "$epoch", "$pkgdesc", "$url",
-            ])
-            .unwrap();
-        replace!(String: self, ac, [pkgname, pkgver, pkgrel, url]);
-        replace!(Option<String>: self, ac, [epoch, pkgdesc]);
-        replace!(Vec<String>: self, ac, [license, source, makedepends]);
-        replace!(Script: self, ac, [package, build, prepare]);
-        self.pkgname = self.pkgname.replace("pkgver", "");
     }
 }
 
