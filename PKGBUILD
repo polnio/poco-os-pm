@@ -11,16 +11,21 @@ source=(
 )
 
 prepare() {
+  cd "$srcdir/$pkgname"
   export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target host-tuple
 }
 
 build() {
+  cd "$srcdir/$pkgname"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release
 }
 
 package() {
+  cd "$srcdir/$pkgname"
+  echo "Installing $pkgname at $pkgdir"
+  mkdir -p "$pkgdir/usr/bin/"
   install -Dm755 -t "$pkgdir/usr/bin/" "target/release/$pkgname"
 }

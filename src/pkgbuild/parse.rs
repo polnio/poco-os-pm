@@ -1,28 +1,8 @@
+use super::PkgBuild;
+use anyhow::{Result, bail};
 use std::io::Read;
 
-#[derive(Debug)]
-pub enum Error {
-    IO(std::io::Error),
-    UnexpectedByte(u8),
-    ExpectedUtf8(std::str::Utf8Error),
-    MissingField(&'static str),
-    UnknownField(String),
-}
-
-macros::make_pkgbuild_struct! {
-    #[derive(Debug)]
-    pub struct PkgBuild {
-        required: [pkgname, pkgver, pkgrel, url],
-        optional: [epoch, pkgdesc],
-        multi: [license, source, makedepends],
-        script: [package, build, prepare],
-    }
-}
-
-#[derive(Debug)]
-pub struct Script(String);
-
-mod macros {
+pub(crate) mod macros {
     macro_rules! make_pkgbuild_struct {
         ($(#[$attr:meta])* $vis:vis struct $name:ident {
             required: [$($req:ident),*],
@@ -39,8 +19,8 @@ mod macros {
             }
 
             impl $name {
-                $vis fn parse(r: impl Read) -> Result<Self, Error> {
-                    let mut reader = Reader::new(r);
+                $vis fn parse(r: impl std::io::Read) -> anyhow::Result<Self> {
+                    let mut reader = parse::Reader::new(r);
                     $(let mut $req = None;)*
                     $(let mut $opt = None;)*
                     $(let mut $mul = Vec::new();)*
@@ -68,7 +48,7 @@ mod macros {
                                     $(stringify!($opt) => Self::parse_str_field(&mut reader, &mut $opt)?,)*
                                     $(stringify!($mul) => Self::parse_list_field(&mut reader, &mut $mul)?,)*
                                     _ => {
-                                        return Err(Error::UnknownField(key));
+                                        anyhow::bail!("Unknown field `{key}`");
                                     }
                                 }
                             }
@@ -89,21 +69,21 @@ mod macros {
                                 }
                                 let value = String::from_utf8(buf)?;
                                 match key.as_str() {
-                                    $(stringify!($scr) => $scr.replace(Script(value)).dummy(),)*
+                                    $(stringify!($scr) => { $scr.replace(Script(value)); })*
                                     _ => {
-                                        return Err(Error::UnknownField(key));
+                                        anyhow::bail!("Unknown script `{key}`");
                                     }
                                 }
                             }
-                            Some(b) => { return Err(Error::UnexpectedByte(b)); }
-                            None => { return Err(Error::IO(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))); }
+                            Some(b) => { anyhow::bail!("Unexpected byte `{b:x}`"); }
+                            None => { anyhow::bail!("Unexpected EOF"); }
                         }
                     }
                     let mut this = Self {
-                        $($req: $req.ok_or(Error::MissingField(stringify!($req)))?,)*
+                        $($req: $req.ok_or_else(|| anyhow::anyhow!(concat!("Missing field `",stringify!($req),"`")))?,)*
                         $($opt,)*
                         $($mul,)*
-                        $($scr: $scr.ok_or(Error::MissingField(stringify!($scr)))?,)*
+                        $($scr: $scr.ok_or_else(|| anyhow::anyhow!(concat!("Missing script `",stringify!($scr),"`")))?,)*
                     };
                     this.fixup();
                     Ok(this)
@@ -127,16 +107,16 @@ mod macros {
     pub(crate) use make_pkgbuild_struct;
 }
 
-struct Reader<R> {
+pub(crate) struct Reader<R> {
     inner: R,
     peeked: Option<u8>,
 }
 
 impl PkgBuild {
-    fn parse_str_field<R: Read>(
+    pub(crate) fn parse_str_field<R: Read>(
         reader: &mut Reader<R>,
         value: &mut Option<String>,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         let mut buf = Vec::new();
         reader.skip_while(|b| b.is_ascii_whitespace() && b != b'\n')?;
         let start = reader.peek_byte()?;
@@ -166,16 +146,21 @@ impl PkgBuild {
         Ok(())
     }
 
-    fn parse_list_field<R: Read>(
+    pub(crate) fn parse_list_field<R: Read>(
         reader: &mut Reader<R>,
         value: &mut Vec<String>,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         let mut buf = Vec::new();
         reader.skip_while(|b| b.is_ascii_whitespace())?;
         reader.expect_byte(b'(')?;
         reader.skip_while(|b| b.is_ascii_whitespace())?;
         while let Some(b) = reader.peek_byte()? {
             match b {
+                b'#' => {
+                    reader.skip_while(|b| b != b'\n')?;
+                    reader.skip_while(|b| b.is_ascii_whitespace())?;
+                    continue;
+                }
                 b')' => {
                     let _ = reader.read_byte();
                     break;
@@ -205,14 +190,14 @@ impl PkgBuild {
 }
 
 impl<R: Read> Reader<R> {
-    fn new(inner: R) -> Self {
+    pub(crate) fn new(inner: R) -> Self {
         Self {
             inner,
             peeked: None,
         }
     }
 
-    fn read_byte(&mut self) -> std::io::Result<Option<u8>> {
+    pub(crate) fn read_byte(&mut self) -> std::io::Result<Option<u8>> {
         if let Some(b) = self.peeked.take() {
             return Ok(Some(b));
         }
@@ -223,14 +208,18 @@ impl<R: Read> Reader<R> {
         }
     }
 
-    fn peek_byte(&mut self) -> std::io::Result<Option<u8>> {
+    pub(crate) fn peek_byte(&mut self) -> std::io::Result<Option<u8>> {
         if self.peeked.is_none() {
             self.peeked = self.read_byte()?;
         }
         Ok(self.peeked)
     }
 
-    fn read_while(&mut self, buf: &mut Vec<u8>, pred: impl Fn(u8) -> bool) -> std::io::Result<()> {
+    pub(crate) fn read_while(
+        &mut self,
+        buf: &mut Vec<u8>,
+        pred: impl Fn(u8) -> bool,
+    ) -> std::io::Result<()> {
         while let Some(byte) = self.peek_byte()? {
             if !(pred)(byte) {
                 break;
@@ -241,7 +230,7 @@ impl<R: Read> Reader<R> {
         Ok(())
     }
 
-    fn skip_while(&mut self, pred: impl Fn(u8) -> bool) -> std::io::Result<()> {
+    pub(crate) fn skip_while(&mut self, pred: impl Fn(u8) -> bool) -> std::io::Result<()> {
         while let Some(byte) = self.peek_byte()? {
             if !(pred)(byte) {
                 break;
@@ -251,42 +240,14 @@ impl<R: Read> Reader<R> {
         Ok(())
     }
 
-    fn expect_byte(&mut self, expected: u8) -> Result<(), Error> {
+    pub(crate) fn expect_byte(&mut self, expected: u8) -> Result<()> {
         let actual = self.read_byte()?;
         let Some(actual) = actual else {
-            return Err(Error::IO(std::io::Error::from(
-                std::io::ErrorKind::UnexpectedEof,
-            )));
+            bail!("Unexpected EOF");
         };
         if actual != expected {
-            return Err(Error::UnexpectedByte(actual));
+            bail!("Unexpected byte `{actual:x}`");
         }
         Ok(())
     }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(value: std::io::Error) -> Self {
-        Self::IO(value)
-    }
-}
-
-impl From<std::string::FromUtf8Error> for Error {
-    fn from(value: std::string::FromUtf8Error) -> Self {
-        Self::ExpectedUtf8(value.utf8_error())
-    }
-}
-
-impl From<std::str::Utf8Error> for Error {
-    fn from(value: std::str::Utf8Error) -> Self {
-        Self::ExpectedUtf8(value)
-    }
-}
-
-trait Dummy {
-    fn dummy(&self) -> ();
-}
-
-impl<T> Dummy for T {
-    fn dummy(&self) {}
 }

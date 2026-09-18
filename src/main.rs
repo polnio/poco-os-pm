@@ -1,9 +1,18 @@
 mod pkgbuild;
 
-fn main() -> Result<(), pkgbuild::Error> {
-    let file = std::fs::File::open("PKGBUILD")?;
+use anyhow::{Context as _, Result};
+
+fn run() -> Result<()> {
+    let file = std::fs::File::open("PKGBUILD").context("Failed to open PKGBUILD")?;
     let buf = std::io::BufReader::new(file);
-    let pkgbuild = pkgbuild::PkgBuild::parse(buf)?;
-    dbg!(pkgbuild);
+    let pkgbuild = pkgbuild::PkgBuild::parse(buf).context("Failed to parse PKGBUILD")?;
+    pkgbuild.build()?;
     Ok(())
+}
+
+fn main() {
+    if let Err(err) = run() {
+        eprintln!("{err:#}");
+        std::process::exit(1);
+    }
 }
