@@ -1,4 +1,5 @@
 use super::{PkgBuild, Script};
+use crate::args::Args;
 use anyhow::{Context as _, Result};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -6,10 +7,9 @@ use std::process::Stdio;
 use ureq::ResponseExt as _;
 
 impl PkgBuild {
-    pub fn build(&self) -> Result<()> {
-        // TODO: make this configurable
-        let dst_dir = Path::new("./root").canonicalize().unwrap();
-        std::fs::create_dir_all(&dst_dir).context("Failed to create destination dir")?;
+    pub fn build(&self, args: &Args) -> Result<()> {
+        std::fs::create_dir_all(&args.target).context("Failed to create destination dir")?;
+        let dst_dir = args.target.canonicalize().unwrap();
         self.check_makedepends()?;
         let src_dir = self.extract_sources()?;
         Self::run_script(&self.prepare, &src_dir, &dst_dir)?;
