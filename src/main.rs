@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result};
 
 fn run() -> Result<()> {
     let args = args::Args::parse();
-    let file = std::fs::File::open("PKGBUILD").context("Failed to open PKGBUILD")?;
+    let file = std::fs::File::open(&args.manifest).context("Failed to open PKGBUILD")?;
     let buf = std::io::BufReader::new(file);
     let pkgbuild = pkgbuild::PkgBuild::parse(buf).context("Failed to parse PKGBUILD")?;
     pkgbuild.build(&args)?;
