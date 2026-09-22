@@ -1,5 +1,6 @@
 use super::{PkgBuild, Script};
 use crate::args::Args;
+use crate::util::ProgressReader;
 use anyhow::{Context as _, Result};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -76,16 +77,25 @@ impl PkgBuild {
             let mut path = Path::new(&path);
             let mut body = response.into_body();
             let mut reader: Box<dyn Read> = Box::new(body.as_reader());
-            if path.extension() == Some("gz".as_ref()) {
-                let decoder = flate2::read::GzDecoder::new(reader);
-                reader = Box::new(decoder);
-                path = Path::new(path.file_stem().unwrap());
-            }
-            if path.extension() == Some("tar".as_ref()) {
-                let mut archive = tar::Archive::new(reader);
-                archive
-                    .unpack(&src_dir)
-                    .context("Failed to unpack source")?;
+            loop {
+                if path.extension() == Some("gz".as_ref()) {
+                    let decoder = flate2::read::GzDecoder::new(reader);
+                    reader = Box::new(decoder);
+                    path = Path::new(path.file_stem().unwrap());
+                    continue;
+                } else if path.extension() == Some("xz".as_ref()) {
+                    let decoder = xz2::read::XzDecoder::new(reader);
+                    reader = Box::new(decoder);
+                    path = Path::new(path.file_stem().unwrap());
+                    continue;
+                } else if path.extension() == Some("tar".as_ref()) {
+                    let mut archive = tar::Archive::new(reader);
+                    archive
+                        .unpack(&src_dir)
+                        .context("Failed to unpack source")?;
+                    break;
+                }
+                anyhow::bail!("Unknown source extension");
             }
         }
         Ok(src_dir)
