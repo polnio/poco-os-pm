@@ -3,21 +3,121 @@ use crate::args::Args;
 #[cfg(feature = "progress")]
 use crate::util::ProgressReader;
 use anyhow::{Context as _, Result};
+use std::hash::Hasher;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use ureq::ResponseExt as _;
 
+#[derive(Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+enum StateStep {
+    #[default]
+    None,
+    Downloaded,
+    Prepared,
+    Built,
+    Packaged,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct State {
+    step: StateStep,
+    makedepends: Vec<String>,
+    sources: Vec<String>,
+    prepare_script: u64,
+    build_script: u64,
+    package_script: u64,
+}
+
 impl PkgBuild {
     pub fn build(&self, args: &Args) -> Result<()> {
+        let pkg_dir =
+            find_pkg_dir(&self.pkgname, &self.pkgver).context("Failed to find source dir")?;
+
+        std::fs::create_dir_all(&pkg_dir).context("Failed to create package dir")?;
         std::fs::create_dir_all(&args.target).context("Failed to create destination dir")?;
+
+        let mut state = self.fetch_state_or_default(&pkg_dir)?;
+        let result = self.try_build(&pkg_dir, args, &mut state);
+
+        let _ = self.save_state(&pkg_dir, &state);
+        result
+    }
+
+    fn try_build(&self, pkg_dir: &Path, args: &Args, state: &mut State) -> Result<()> {
         let dst_dir = args.target.canonicalize().unwrap();
-        self.check_makedepends()?;
-        let src_dir = self.extract_sources()?;
         let manifest_dir = args.manifest.parent().unwrap();
-        Self::run_script(&self.prepare, &src_dir, &dst_dir, manifest_dir)?;
-        Self::run_script(&self.build, &src_dir, &dst_dir, manifest_dir)?;
-        Self::run_script(&self.package, &src_dir, &dst_dir, manifest_dir)?;
+
+        self.check_makedepends()?;
+        if state.step < StateStep::Downloaded {
+            self.extract_sources(pkg_dir)?;
+            state.step = StateStep::Downloaded;
+        }
+        if state.step < StateStep::Prepared {
+            self.prepare.run_script(pkg_dir, &dst_dir, manifest_dir)?;
+            state.step = StateStep::Prepared;
+        }
+        if state.step < StateStep::Built {
+            self.build.run_script(pkg_dir, &dst_dir, manifest_dir)?;
+            state.step = StateStep::Built;
+        }
+        if state.step < StateStep::Packaged {
+            self.package.run_script(pkg_dir, &dst_dir, manifest_dir)?;
+            state.step = StateStep::Packaged;
+        }
+        Ok(())
+    }
+
+    fn fetch_state_or_default(&self, pkg_dir: &Path) -> Result<State> {
+        let state_path = pkg_dir.join("state");
+        let file = match std::fs::File::open(&state_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
+            Err(err) => return Err(err.into()),
+        };
+        let mut buf = [0; 1024];
+        let (mut state, _) = postcard::from_io::<State, _>((file, &mut buf))?;
+
+        let mut hasher = std::hash::DefaultHasher::new();
+        hasher.write(self.prepare.0.as_bytes());
+        let prepare_hash = hasher.finish();
+
+        let mut hasher = std::hash::DefaultHasher::new();
+        hasher.write(self.build.0.as_bytes());
+        let build_hash = hasher.finish();
+
+        let mut hasher = std::hash::DefaultHasher::new();
+        hasher.write(self.package.0.as_bytes());
+        let package_hash = hasher.finish();
+
+        if state.step >= StateStep::Built && state.makedepends != self.makedepends {
+            state.step = StateStep::Downloaded;
+            state.makedepends = self.makedepends.clone();
+        }
+        if state.step >= StateStep::Packaged && state.package_script != package_hash {
+            state.step = StateStep::Built;
+            state.package_script = package_hash;
+        }
+        if state.step >= StateStep::Built && state.build_script != build_hash {
+            state.step = StateStep::Prepared;
+            state.build_script = build_hash;
+        }
+        if state.step >= StateStep::Prepared && state.prepare_script != prepare_hash {
+            state.step = StateStep::Downloaded;
+            state.prepare_script = prepare_hash;
+        }
+        if state.step >= StateStep::Downloaded && state.sources != self.source {
+            state.step = StateStep::None;
+            state.sources = self.source.clone();
+        }
+
+        Ok(state)
+    }
+
+    fn save_state(&self, pkg_dir: &Path, state: &State) -> Result<()> {
+        let state_path = pkg_dir.join("state");
+        let file = std::fs::File::create(&state_path)?;
+        postcard::to_io(state, file)?;
         Ok(())
     }
 
@@ -43,40 +143,8 @@ impl PkgBuild {
         Ok(())
     }
 
-    fn run_script(
-        script: &Script,
-        src_dir: &Path,
-        dst_dir: &Path,
-        manifest_dir: &Path,
-    ) -> Result<()> {
-        let mut child = std::process::Command::new("/bin/sh")
-            .current_dir(manifest_dir)
-            .env("srcdir", src_dir)
-            .env("pkgdir", dst_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        let mut stdin = child.stdin.take().context("Failed to open stdin")?;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                stdin.write_all(script.0.as_bytes())?;
-                drop(stdin); // Dunno why it is not automatically dropped
-                Ok::<_, std::io::Error>(())
-            });
-            child.wait()?;
-            anyhow::Ok(())
-        })?;
-        Ok(())
-    }
-
-    fn extract_sources(&self) -> Result<PathBuf> {
-        let src_dir =
-            find_src_dir(&self.pkgname, &self.pkgver).context("Failed to find source dir")?;
-        if src_dir.exists() {
-            return Ok(src_dir);
-        }
-        std::fs::create_dir_all(&src_dir).context("Failed to create source dir")?;
+    fn extract_sources(&self, pkg_dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(pkg_dir).context("Failed to create source dir")?;
         for source in &self.source {
             let response = ureq::get(source)
                 .call()
@@ -139,9 +207,7 @@ impl PkgBuild {
                 #[cfg(feature = "tar")]
                 if path.extension() == Some("tar".as_ref()) {
                     let mut archive = tar::Archive::new(reader);
-                    archive
-                        .unpack(&src_dir)
-                        .context("Failed to unpack source")?;
+                    archive.unpack(pkg_dir).context("Failed to unpack source")?;
                     break;
                 }
                 anyhow::bail!("Unknown source extension");
@@ -149,11 +215,35 @@ impl PkgBuild {
             #[cfg(feature = "progress")]
             let _ = progress_task.join();
         }
-        Ok(src_dir)
+        Ok(())
     }
 }
 
-fn find_src_dir(name: &str, version: &str) -> Option<PathBuf> {
+impl Script {
+    fn run_script(&self, pkg_dir: &Path, dst_dir: &Path, manifest_dir: &Path) -> Result<()> {
+        let mut child = std::process::Command::new("/bin/sh")
+            .current_dir(manifest_dir)
+            .env("srcdir", pkg_dir.join("sources"))
+            .env("pkgdir", dst_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let mut stdin = child.stdin.take().context("Failed to open stdin")?;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                stdin.write_all(self.0.as_bytes())?;
+                drop(stdin); // Dunno why it is not automatically dropped
+                Ok::<_, std::io::Error>(())
+            });
+            child.wait()?;
+            anyhow::Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+fn find_pkg_dir(name: &str, version: &str) -> Option<PathBuf> {
     dirs::cache_dir().or_else(dirs::home_dir).map(|mut dir| {
         dir.push(format!("{}/{}-{}", env!("CARGO_PKG_NAME"), name, version));
         dir
