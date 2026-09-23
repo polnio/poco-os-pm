@@ -1,5 +1,6 @@
 use super::{PkgBuild, Script};
 use crate::args::Args;
+#[cfg(feature = "progress")]
 use crate::util::ProgressReader;
 use anyhow::{Context as _, Result};
 use std::io::{Read, Write};
@@ -73,6 +74,7 @@ impl PkgBuild {
             let response = ureq::get(source)
                 .call()
                 .context("Failed to download source")?;
+            #[cfg(feature = "progress")]
             let size: usize = response
                 .headers()
                 .get("Content-Length")
@@ -83,8 +85,13 @@ impl PkgBuild {
             let path = response.get_uri().path().to_owned();
             let mut path = Path::new(&path);
             let mut body = response.into_body();
+            #[cfg(feature = "progress")]
             let (sender, receiver) = std::sync::mpsc::channel();
+            #[cfg(feature = "progress")]
             let mut reader: Box<dyn Read> = Box::new(ProgressReader::new(body.as_reader(), sender));
+            #[cfg(not(feature = "progress"))]
+            let mut reader: Box<dyn Read> = Box::new(body.as_reader());
+            #[cfg(feature = "progress")]
             let progress_task = std::thread::spawn(move || {
                 let bar = indicatif::ProgressBar::new(size as u64);
                 bar.set_style(
@@ -101,17 +108,22 @@ impl PkgBuild {
             });
 
             loop {
+                #[cfg(feature = "gz")]
                 if path.extension() == Some("gz".as_ref()) {
                     let decoder = flate2::read::GzDecoder::new(reader);
                     reader = Box::new(decoder);
                     path = Path::new(path.file_stem().unwrap());
                     continue;
-                } else if path.extension() == Some("xz".as_ref()) {
+                }
+                #[cfg(feature = "xz")]
+                if path.extension() == Some("xz".as_ref()) {
                     let decoder = xz2::read::XzDecoder::new(reader);
                     reader = Box::new(decoder);
                     path = Path::new(path.file_stem().unwrap());
                     continue;
-                } else if path.extension() == Some("tar".as_ref()) {
+                }
+                #[cfg(feature = "tar")]
+                if path.extension() == Some("tar".as_ref()) {
                     let mut archive = tar::Archive::new(reader);
                     archive
                         .unpack(&src_dir)
@@ -120,6 +132,7 @@ impl PkgBuild {
                 }
                 anyhow::bail!("Unknown source extension");
             }
+            #[cfg(feature = "progress")]
             let _ = progress_task.join();
         }
         Ok(src_dir)
