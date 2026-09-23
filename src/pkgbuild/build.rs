@@ -144,7 +144,7 @@ impl PkgBuild {
     }
 
     fn extract_sources(&self, pkg_dir: &Path) -> Result<()> {
-        std::fs::create_dir_all(pkg_dir).context("Failed to create source dir")?;
+        std::fs::create_dir_all(pkg_dir.join("sources")).context("Failed to create source dir")?;
         for source in &self.source {
             let response = ureq::get(source)
                 .call()
@@ -207,7 +207,9 @@ impl PkgBuild {
                 #[cfg(feature = "tar")]
                 if path.extension() == Some("tar".as_ref()) {
                     let mut archive = tar::Archive::new(reader);
-                    archive.unpack(pkg_dir).context("Failed to unpack source")?;
+                    archive
+                        .unpack(pkg_dir.join("sources"))
+                        .context("Failed to unpack source")?;
                     break;
                 }
                 anyhow::bail!("Unknown source extension");
