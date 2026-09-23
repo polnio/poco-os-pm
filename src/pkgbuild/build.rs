@@ -14,9 +14,10 @@ impl PkgBuild {
         let dst_dir = args.target.canonicalize().unwrap();
         self.check_makedepends()?;
         let src_dir = self.extract_sources()?;
-        Self::run_script(&self.prepare, &src_dir, &dst_dir)?;
-        Self::run_script(&self.build, &src_dir, &dst_dir)?;
-        Self::run_script(&self.package, &src_dir, &dst_dir)?;
+        let manifest_dir = args.manifest.parent().unwrap();
+        Self::run_script(&self.prepare, &src_dir, &dst_dir, manifest_dir)?;
+        Self::run_script(&self.build, &src_dir, &dst_dir, manifest_dir)?;
+        Self::run_script(&self.package, &src_dir, &dst_dir, manifest_dir)?;
         Ok(())
     }
 
@@ -42,8 +43,14 @@ impl PkgBuild {
         Ok(())
     }
 
-    fn run_script(script: &Script, src_dir: &Path, dst_dir: &Path) -> Result<()> {
+    fn run_script(
+        script: &Script,
+        src_dir: &Path,
+        dst_dir: &Path,
+        manifest_dir: &Path,
+    ) -> Result<()> {
         let mut child = std::process::Command::new("/bin/sh")
+            .current_dir(manifest_dir)
             .env("srcdir", src_dir)
             .env("pkgdir", dst_dir)
             .stdin(Stdio::piped())
