@@ -108,6 +108,13 @@ impl PkgBuild {
             });
 
             loop {
+                #[cfg(feature = "bz2")]
+                if path.extension() == Some("bz2".as_ref()) {
+                    let decoder = bzip2::read::BzDecoder::new(reader);
+                    reader = Box::new(decoder);
+                    path = Path::new(path.file_stem().unwrap());
+                    continue;
+                }
                 #[cfg(feature = "gz")]
                 if path.extension() == Some("gz".as_ref()) {
                     let decoder = flate2::read::GzDecoder::new(reader);
