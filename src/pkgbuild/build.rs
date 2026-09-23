@@ -73,10 +73,33 @@ impl PkgBuild {
             let response = ureq::get(source)
                 .call()
                 .context("Failed to download source")?;
+            let size: usize = response
+                .headers()
+                .get("Content-Length")
+                .context("No Content-Length header")
+                .and_then(|s| s.to_str().map_err(Into::into))
+                .and_then(|s| s.parse().map_err(Into::into))
+                .context("Failed to parse Content-Length header")?;
             let path = response.get_uri().path().to_owned();
             let mut path = Path::new(&path);
             let mut body = response.into_body();
-            let mut reader: Box<dyn Read> = Box::new(body.as_reader());
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let mut reader: Box<dyn Read> = Box::new(ProgressReader::new(body.as_reader(), sender));
+            let progress_task = std::thread::spawn(move || {
+                let bar = indicatif::ProgressBar::new(size as u64);
+                bar.set_style(
+                    indicatif::ProgressStyle::with_template(
+                        "{wide_bar} {bytes}/{total_bytes} ({eta})",
+                    )
+                    .unwrap(),
+                );
+                let mut progress = 0;
+                while let Ok(n) = receiver.recv() {
+                    progress += n;
+                    bar.set_position(progress as u64);
+                }
+            });
+
             loop {
                 if path.extension() == Some("gz".as_ref()) {
                     let decoder = flate2::read::GzDecoder::new(reader);
@@ -97,6 +120,7 @@ impl PkgBuild {
                 }
                 anyhow::bail!("Unknown source extension");
             }
+            let _ = progress_task.join();
         }
         Ok(src_dir)
     }

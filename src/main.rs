@@ -1,5 +1,6 @@
 mod args;
 mod pkgbuild;
+mod util;
 
 use anyhow::{Context as _, Result};
 
